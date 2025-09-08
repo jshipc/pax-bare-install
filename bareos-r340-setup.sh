@@ -2,66 +2,68 @@
 # ==============================================================================
 # r340-bareos-full-setup.sh
 #
-# One-shot setup for a Dell R340 Bareos server on Ubuntu 24.04/25.04:
-#   - Build a LARGE DISK POOL on SAS drives (ZFS raidz2 OR LVM+XFS).
-#   - Bind-mount the pool to /var/lib/bareos/storage (so Bareos uses it).
-#   - Add the official Bareos repository (CURRENT) and install:
-#       bareos, bareos-database-postgresql, bareos-webui
+# One-shot build for a Dell R340 backup server on Ubuntu 24.04/25.04:
+#   1) (Optional) Create a large backup pool on SAS disks (ZFS raidz2 OR LVM+XFS)
+#   2) Bind-mount that pool to /var/lib/bareos/storage (Bareos FileStorage default)
+#   3) Add Bareos APT repo (CURRENT) + install bareos + DB + WebUI
+#   4) Initialize the PostgreSQL catalog and start services
 #
-# Safety / Idempotence:
-#   - Will not wipe disks unless WIPE_DISKS=true.
-#   - Will not recreate pools/volumes if they already exist.
-#   - Fails fast on repo key 404 to avoid "gpg: no valid OpenPGP data found".
+# FIXES INCLUDED:
+#   - Use https://download.bareos.org/current/<series>/Release.key (old path 404’d)
+#   - If bareos-database-setup is missing, use canonical helper scripts:
+#       create_bareos_database, make_bareos_tables, grant_bareos_privileges
+#   - WebUI is an Apache conf — start *apache2*, not a nonexistent bareos-webui.service
 #
-# Customize the TOGGLES section below, then run as root.
+# SAFETY:
+#   - Won’t wipe disks unless WIPE_DISKS=true and you confirm "YES"
+#   - Idempotent where practical: re-runs won’t recreate pools/volumes/configs
 # ==============================================================================
 
 set -euo pipefail
 
-# ── Pretty printing helpers ────────────────────────────────────────────────────
+# ── Pretty output helpers ──────────────────────────────────────────────────────
 info()  { printf "\033[1;36m[INFO]\033[0m %s\n" "$*"; }
 ok()    { printf "\033[1;32m[ OK ]\033[0m %s\n" "$*"; }
 warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
 fail()  { printf "\033[1;31m[FAIL]\033[0m %s\n" "$*"; exit 1; }
 need()  { command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"; }
 
-# ── TOGGLES: adjust to your environment ───────────────────────────────────────
-# Choose how to build the big backup pool on SAS disks:
+# ── TOGGLES: adjust for your environment ──────────────────────────────────────
+# Choose backing pool type for the large backup volume:
 POOL_MODE="ZFS"                # "ZFS"  or  "LVM"
 
-# List ONLY the SAS data disks (NOT the BOSS SSDs). Edit as needed.
+# List ONLY your SAS data disks (NOT the BOSS SSDs). Adjust to match `lsblk`.
 SAS_DISKS=(/dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf /dev/sdg /dev/sdh)
 
-# DANGER: if true, zaps partition tables & signatures before creating the pool.
-WIPE_DISKS=false               # true/false
+# DANGER: if true, will wipe partition tables & FS signatures on SAS_DISKS.
+WIPE_DISKS=false
 
-# Where the large pool mounts, and where Bareos expects FileStorage by default.
+# Where the big pool is mounted, and where Bareos FileStorage expects to write:
 POOL_MNT="/srv/bareos-disk"
 BAREOS_STORAGE_DIR="/var/lib/bareos/storage"
 BIND_MOUNT=true                # bind POOL_MNT → /var/lib/bareos/storage
 
-# ZFS layout (used if POOL_MODE=ZFS)
+# ZFS options (if POOL_MODE=ZFS)
 ZPOOL_NAME="bareospool"
 ZFS_LAYOUT="raidz2"            # raidz2 recommended for 6–10 disks
 ZFS_DATASET="${ZPOOL_NAME}/disk"
-# Sensible dataset options for large sequential workloads (backups)
 ZFS_OPTS=(-O compression=lz4 -O atime=off -O xattr=sa -O acltype=posixacl -O recordsize=1M)
 
-# LVM layout (used if POOL_MODE=LVM)
+# LVM options (if POOL_MODE=LVM)
 VG_NAME="bareos-vg"
 LV_NAME="bareos-lv"
-LV_SIZE="100%FREE"            # or "8T"
-LVM_FS="xfs"                  # xfs recommended for big files
+LV_SIZE="100%FREE"            # or "8T", etc.
+LVM_FS="xfs"                  # xfs is great for large sequential files
 
-# Optional: force Bareos series via env var SERIES= (e.g., SERIES=xUbuntu_24.04)
-# Otherwise we detect from OS version.
-# ──────────────────────────────────────────────────────────────────────────────
+# Optional: force Bareos series via env (e.g., `SERIES=xUbuntu_24.04 ./script.sh`)
+# Otherwise we auto-detect from OS version.
+# ───────────────────────────────────────────────────────────────────────────────
 
-# ── Detect Bareos repo "series" string (xUbuntu_25.04, xUbuntu_24.04, …) ─────
+# ── Detect Bareos repo series (xUbuntu_25.04, xUbuntu_24.04, …) ───────────────
 detect_series() {
   local ver=""
   if command -v lsb_release >/dev/null 2>&1; then
-    ver="$(lsb_release -sr)"
+    ver="$(lsb_release -sr)"                 # "25.04", "24.04", …
   elif [[ -f /etc/os-release ]]; then
     ver="$(. /etc/os-release; echo "${VERSION_ID:-}")"
   fi
@@ -75,13 +77,13 @@ detect_series() {
 SERIES="${SERIES:-$(detect_series)}"
 info "Using Bareos repository series: ${SERIES}"
 
-# ── Pre-flight checks ─────────────────────────────────────────────────────────
+# ── Pre-flight checks ──────────────────────────────────────────────────────────
 need lsblk; need awk
 mkdir -p "$POOL_MNT" "$BAREOS_STORAGE_DIR"
 
-info "Verifying listed SAS disks exist and are block devices:"
+info "Verifying SAS disks exist as block devices:"
 for d in "${SAS_DISKS[@]}"; do
-  [[ -b "$d" ]] || fail "$d is not a block device; update SAS_DISKS"
+  [[ -b "$d" ]] || fail "$d is not a block device; edit SAS_DISKS in the script"
   echo "  - $d ($(lsblk -dn -o SIZE,MODEL "$d" | awk '{print $1" "$2}'))"
 done
 
@@ -95,26 +97,25 @@ if [[ "$WIPE_DISKS" == "true" ]]; then
     sgdisk --zap-all "$d" || true
     wipefs -a "$d" || true
   done
-  ok "Wipe complete"
+  ok "Disk wipe complete"
 fi
 
-# ── Build the data pool ───────────────────────────────────────────────────────
+# ── Build the large backup pool ────────────────────────────────────────────────
 if [[ "$POOL_MODE" == "ZFS" ]]; then
   info "Installing ZFS utilities…"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y zfsutils-linux
-
   need zpool; need zfs
 
-  info "Creating ZFS pool (if absent): $ZPOOL_NAME  layout: $ZFS_LAYOUT  disks: ${SAS_DISKS[*]}"
+  info "Ensuring ZFS pool '$ZPOOL_NAME' exists (layout: $ZFS_LAYOUT)…"
   if ! zpool list "$ZPOOL_NAME" &>/dev/null; then
     zpool create -f "$ZPOOL_NAME" "$ZFS_LAYOUT" "${SAS_DISKS[@]}"
   else
-    ok "ZFS pool $ZPOOL_NAME already exists"
+    ok "ZFS pool $ZPOOL_NAME already present"
   fi
 
-  info "Ensuring dataset exists with tuned options"
+  info "Ensuring dataset '$ZFS_DATASET' exists with tuned options"
   if ! zfs list "$ZFS_DATASET" &>/dev/null; then
     zfs create "${ZFS_OPTS[@]}" "$ZFS_DATASET"
   fi
@@ -128,7 +129,7 @@ elif [[ "$POOL_MODE" == "LVM" ]]; then
   apt-get install -y lvm2 xfsprogs
   need pvcreate; need vgcreate; need lvcreate
 
-  info "Creating PVs if missing"
+  info "Creating PVs (if missing)"
   for d in "${SAS_DISKS[@]}"; do
     if ! pvs --noheadings "$d" &>/dev/null; then
       pvcreate -ff -y "$d"
@@ -138,14 +139,14 @@ elif [[ "$POOL_MODE" == "LVM" ]]; then
     fi
   done
 
-  info "Creating VG $VG_NAME if missing"
+  info "Creating VG '$VG_NAME' (if missing)"
   if ! vgdisplay "$VG_NAME" &>/dev/null; then
     vgcreate "$VG_NAME" "${SAS_DISKS[@]}"
   else
     ok "VG $VG_NAME exists"
   fi
 
-  info "Creating LV $LV_NAME if missing"
+  info "Creating LV '$LV_NAME' (if missing)"
   if ! lvdisplay "/dev/$VG_NAME/$LV_NAME" &>/dev/null; then
     lvcreate -n "$LV_NAME" -l "$LV_SIZE" "$VG_NAME"
   else
@@ -155,13 +156,13 @@ elif [[ "$POOL_MODE" == "LVM" ]]; then
   LV_DEV="/dev/$VG_NAME/$LV_NAME"
   FS_TYPE="$(lsblk -no FSTYPE "$LV_DEV" || true)"
   if [[ -z "$FS_TYPE" ]]; then
-    info "Making filesystem $LVM_FS on $LV_DEV"
+    info "Formatting $LV_DEV as $LVM_FS"
     mkfs."$LVM_FS" -f "$LV_DEV"
   else
     ok "$LV_DEV already formatted as $FS_TYPE"
   fi
 
-  # mount via fstab (UUID)
+  # Add to fstab via UUID (so device names can change safely)
   UUID=$(blkid -s UUID -o value "$LV_DEV")
   grep -q "$UUID" /etc/fstab || {
     info "Adding $LV_DEV to /etc/fstab"
@@ -174,22 +175,21 @@ else
   fail "POOL_MODE must be 'ZFS' or 'LVM'"
 fi
 
-# ── Bind-mount big pool → Bareos storage path (keeps Bareos defaults simple) ──
+# ── Bind-mount the pool to Bareos FileStorage path ────────────────────────────
 if [[ "$BIND_MOUNT" == "true" ]]; then
-  info "Setting up bind-mount: $POOL_MNT  →  $BAREOS_STORAGE_DIR"
+  info "Bind-mounting $POOL_MNT  →  $BAREOS_STORAGE_DIR"
   mkdir -p "$BAREOS_STORAGE_DIR"
   if ! grep -qE "^[[:space:]]*${POOL_MNT}[[:space:]]+${BAREOS_STORAGE_DIR}[[:space:]]+none[[:space:]]+bind" /etc/fstab; then
     echo "$POOL_MNT  $BAREOS_STORAGE_DIR  none  bind  0 0" >> /etc/fstab
   fi
   mountpoint -q "$BAREOS_STORAGE_DIR" || mount "$BAREOS_STORAGE_DIR"
-  ok "Bind-mount active"
 fi
-
-# Ensure ownership for Bareos SD
+# Ensure Bareos SD can write
 chown -R bareos:bareos "$BAREOS_STORAGE_DIR" 2>/dev/null || true
+ok "Storage location ready: $BAREOS_STORAGE_DIR"
 
-# ── Add Bareos repo (CURRENT) with 404 guard, then install Bareos ─────────────
-info "Preparing to add Bareos apt repo (CURRENT) for ${SERIES}"
+# ── Add Bareos APT repo (CURRENT) with 404 guard ──────────────────────────────
+info "Adding Bareos repository (series: ${SERIES})"
 apt-get install -y curl gpg ca-certificates apt-transport-https
 
 KEY_URL="https://download.bareos.org/current/${SERIES}/Release.key"
@@ -200,7 +200,7 @@ TMPKEY="$(mktemp)"
 info "Downloading repo key: $KEY_URL"
 if ! curl -fSLo "$TMPKEY" "$KEY_URL"; then
   rm -f "$TMPKEY"
-  fail "Bareos key download failed (likely 404). Try: SERIES=xUbuntu_24.04 ./this_script.sh"
+  fail "Bareos key download failed (HTTP error). Try: SERIES=xUbuntu_24.04 ./r340-bareos-full-setup.sh"
 fi
 
 info "Installing repo key → $KEYRING"
@@ -208,7 +208,7 @@ gpg --dearmor < "$TMPKEY" | tee "$KEYRING" >/dev/null
 rm -f "$TMPKEY"
 
 REPO_LINE="deb [signed-by=${KEYRING}] https://download.bareos.org/current/${SERIES}/ /"
-info "Writing apt source → $LISTFILE"
+info "Writing APT source → $LISTFILE"
 echo "$REPO_LINE" > "$LISTFILE"
 
 info "apt update → install Bareos stack"
@@ -221,33 +221,43 @@ fi
 ok "Bareos packages installed"
 
 # ── Initialize Bareos catalog (PostgreSQL) ────────────────────────────────────
+info "Initializing Bareos PostgreSQL catalog (idempotent)…"
 if command -v bareos-database-setup >/dev/null 2>&1; then
-  info "Initializing Bareos PostgreSQL catalog (idempotent)…"
+  # Some builds ship this wrapper; harmless if it says "already exists"
   bareos-database-setup postgresql || warn "Catalog init returned non-zero (may already exist)."
 else
-  warn "bareos-database-setup not found; skipping DB init."
+  # Canonical helper scripts shipped by bareos-database-postgresql
+  if [[ -x /usr/lib/bareos/scripts/create_bareos_database ]]; then
+    /usr/lib/bareos/scripts/create_bareos_database       || true
+    /usr/lib/bareos/scripts/make_bareos_tables           || true
+    /usr/lib/bareos/scripts/grant_bareos_privileges      || true
+  else
+    warn "Bareos DB helper scripts not found in /usr/lib/bareos/scripts (is bareos-database-postgresql installed?)"
+  fi
 fi
 
-# ── Enable services ───────────────────────────────────────────────────────────
-info "Enabling and starting Bareos services (dir/sd/fd + webui)…"
-systemctl enable --now bareos-dir bareos-sd bareos-fd bareos-webui
-ok "Services running. Use: systemctl status bareos-{dir,sd,fd} bareos-webui"
+# ── Enable services (Bareos daemons + Apache for WebUI) ───────────────────────
+info "Enabling and starting Bareos services and Apache (WebUI)…"
+systemctl enable --now bareos-dir bareos-sd bareos-fd || fail "Failed to start Bareos daemons"
+# WebUI is served by Apache; there is no separate bareos-webui.service unit
+systemctl enable --now apache2 || warn "Apache2 failed to start; WebUI will be unavailable"
+# Ensure the Bareos WebUI Apache config is active
+a2enconf bareos-webui 2>/dev/null || true
+systemctl reload apache2 2>/dev/null || true
+ok "Services running (bareos-dir/sd/fd + apache2)"
 
-# ── Final summary & tips ──────────────────────────────────────────────────────
+# ── Final summary & quick checks ──────────────────────────────────────────────
 echo
 ok  "POOL_MODE: ${POOL_MODE}"
-ok  "Data pool mount: ${POOL_MNT}"
+ok  "Pool mount: ${POOL_MNT}"
 ok  "Bind → ${BAREOS_STORAGE_DIR}: ${BIND_MOUNT}"
 ok  "Bareos repo: ${REPO_LINE}"
 ok  "Bareos series: ${SERIES}"
 echo
-info "Quick checks:"
-echo "  - zpool status / zfs list    (if ZFS)   |  lvs/vgs/pvs (if LVM)"
-echo "  - df -h $POOL_MNT $BAREOS_STORAGE_DIR"
-echo "  - bconsole → 'status storage=FileStorage'"
-echo "  - WebUI: http://<server_ip>/bareos-webui/"
-echo
-info "Next steps:"
-echo "  1) Add your tape autochanger (e.g., TL2000) in /etc/bareos/bareos-sd.d/"
-echo "  2) Create a small test backup job & restore to verify reads/writes."
-echo "  3) Consider snapshots (ZFS) or LV snapshots before tape migration."
+info "Run these quick checks:"
+echo "  - df -h ${POOL_MNT} ${BAREOS_STORAGE_DIR}"
+echo "  - (ZFS) zpool status && zfs list   |  (LVM) lvs && vgs && pvs"
+echo "  - systemctl status --no-pager bareos-dir bareos-sd bareos-fd apache2"
+echo "  - sudo -u postgres psql -Atc \"SELECT datname FROM pg_database\" | grep -i bareos"
+echo "  - bconsole → 'status director', 'status storage=FileStorage'"
+echo "  - WebUI:  http://<server_ip>/bareos-webui/"
